@@ -1,0 +1,96 @@
+#include <stdio.h>
+#include "system.h"
+#include "altera_avalon_timer_regs.h"
+#include "altera_avalon_pio_regs.h" // Thư viện cho PIO
+#include "sys/alt_irq.h"
+#include "unistd.h"
+
+// Biến toàn cục lưu thời gian
+volatile int seconds = 0;
+volatile int minutes = 0;
+volatile int hours = 0;
+
+// Mảng mã LED 7 đoạn (Anode chung: 0 là sáng, 1 là tắt)
+// Số: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+unsigned char table[10] = {0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90};
+
+// Hàm hiển thị lên HEX
+void update_clock_display() {
+    // Hiển thị Giây (HEX0, HEX1)
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX0_BASE, table[seconds % 10]);
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX1_BASE, table[seconds / 10]);
+
+    // Hiển thị Phút (HEX2, HEX3)
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX2_BASE, table[minutes % 10]);
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX3_BASE, table[minutes / 10]);
+
+    // Hiển thị Giờ (HEX4, HEX5)
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX4_BASE, table[hours % 10]);
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX5_BASE, table[hours / 10]);
+}
+
+// Hàm xử lý ngắt Timer
+void Timer_IRQ_Handler(void* isr_context) {
+    // Xóa cờ ngắt Timer [cite: 319-321]
+    IOWR_ALTERA_AVALON_TIMER_STATUS(TIMER_0_BASE, 0);
+
+    // Tăng thời gian
+    seconds++;
+    if (seconds >= 60) {
+        seconds = 0;
+        minutes++;
+        if (minutes >= 60) {
+            minutes = 0;
+            hours++;
+            if (hours >= 24) {
+                hours = 0;
+            }
+        }
+    }
+
+    // Cập nhật màn hình ngay trong ngắt (hoặc đặt cờ để main cập nhật)
+    update_clock_display();
+}
+
+void timer_Init() {
+    // Dừng Timer [cite: 301-303]
+    IOWR_ALTERA_AVALON_TIMER_CONTROL(TIMER_0_BASE, ALTERA_AVALON_TIMER_CONTROL_STOP_MSK);
+
+    // Cấu hình chu kỳ đếm: 1 giây
+    // Clock 50MHz => 50,000,000 chu kỳ = 1 giây [cite: 307]
+    unsigned int period = 50000000;
+    IOWR_ALTERA_AVALON_TIMER_PERIODL(TIMER_0_BASE, period);
+    IOWR_ALTERA_AVALON_TIMER_PERIODH(TIMER_0_BASE, period >> 16);
+
+    // Khởi động Timer, chế độ Continuous, cho phép ngắt (ITO) [cite: 313-315]
+    IOWR_ALTERA_AVALON_TIMER_CONTROL(TIMER_0_BASE,
+        ALTERA_AVALON_TIMER_CONTROL_CONT_MSK |
+        ALTERA_AVALON_TIMER_CONTROL_ITO_MSK |
+        ALTERA_AVALON_TIMER_CONTROL_START_MSK);
+}
+
+void int main() {
+    // Khởi tạo Timer
+    timer_Init();
+
+    // Đăng ký ngắt [cite: 325]
+    alt_ic_isr_register(TIMER_0_IRQ_INTERRUPT_CONTROLLER_ID,
+                        TIMER_0_IRQ,
+                        Timer_IRQ_Handler,
+                        NULL, NULL);
+
+    while(1) {
+        // Tùy chỉnh đồng hồ (Bài tập yêu cầu sinh viên tự quy định)
+        // Ví dụ: Đọc Switch để chỉnh giờ
+        int sw_val = IORD_ALTERA_AVALON_PIO_DATA(PIO_SW_BASE);
+
+        // Logic ví dụ: Nếu SW[0] bật thì tăng phút nhanh
+        if (sw_val & 0x01) {
+            minutes++;
+            if(minutes >= 60) minutes = 0;
+            update_clock_display();
+            usleep(200000); // Delay chống dội phím
+        }
+    }
+    return 0;
+}

@@ -1,0 +1,180 @@
+#include <stdio.h> /
+#include "system.h"
+#include "altera_avalon_timer_regs.h"
+#include "altera_avalon_pio_regs.h"
+#include "sys/alt_irq.h"
+#include "unistd.h"
+
+
+// KHAI BÁO CÁC HẰNG SỐ VÀ BIẾN TOÀN CỤC
+
+// Biến lưu trữ thời gian thực tế. Dùng 'volatile' vì chúng được thay đổi bởi ngắt.
+volatile int seconds = 0;
+volatile int minutes = 0;
+volatile int hours = 0;
+
+// Trạng thái đồng hồ: 1=CHẠY (Mặc định khi reset), 0=DỪNG.
+volatile int clock_running = 1;
+
+// Biến lưu trạng thái 4 bit thấp của Switch ở lần đọc trước
+// Dùng để phát hiện cạnh (từ BẬT sang TẮT hoặc ngược lại) để chống dội phím.
+unsigned int last_sw_val = 0;
+
+// Mảng mã LED 7 đoạn (Anode chung: 0 là sáng, 1 là tắt)
+// Mỗi giá trị hex tương ứng với 8 bit (7 đoạn LED + 1 dấu chấm thập phân)
+unsigned char table[10] = {
+    0xC0, // Mã hiển thị số 0 (1100 0000)
+    0xF9, // Mã hiển thị số 1 (1111 1001)
+    0xA4, // Mã hiển thị số 2 (1010 0100)
+    0xB0, // Mã hiển thị số 3 (1011 0000)
+    0x99, // Mã hiển thị số 4 (1001 1001)
+    0x92, // Mã hiển thị số 5 (1001 0010)
+    0x82, // Mã hiển thị số 6 (1000 0010)
+    0xF8, // Mã hiển thị số 7 (1111 1000)
+    0x80, // Mã hiển thị số 8 (1000 0000)
+    0x90  // Mã hiển thị số 9 (1001 0000)
+};
+
+// HÀM HIỂN THỊ (update_clock_display)
+
+// Ghi giá trị thời gian (seconds, minutes, hours)
+void update_clock_display() {
+    // HEX0 (Đơn vị Giây)
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX0_BASE, table[seconds % 10]);
+    // HEX1 (Chục Giây)
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX1_BASE, table[seconds / 10]);
+
+    // HEX2 (Đơn vị Phút)
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX2_BASE, table[minutes % 10]);
+    // HEX3 (Chục Phút)
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX3_BASE, table[minutes / 10]);
+
+    // HEX4 (Đơn vị Giờ)
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX4_BASE, table[hours % 10]);
+    // HEX5 (Chục Giờ)
+    IOWR_ALTERA_AVALON_PIO_DATA(PIO_HEX5_BASE, table[hours / 10]);
+}
+
+
+// HÀM XỬ LÝ NGẮT (Interrupt Service Routine - ISR)
+// Hàm này được gọi tự động mỗi 1 giây khi Timer đếm hết chu kỳ
+void Timer_IRQ_Handler(void* isr_context) {
+    // Bước 1: Xóa cờ ngắt Timeout (TO) trong thanh ghi STATUS của Timer.
+    // Nếu không xóa, ngắt sẽ được gọi lại ngay lập tức.
+    IOWR_ALTERA_AVALON_TIMER_STATUS(TIMER_0_BASE, 0);
+
+    // Bước 2: Chỉ tăng thời gian nếu đồng hồ đang ở trạng thái CHẠY
+    if (clock_running) {
+        seconds++;
+        if (seconds >= 60) {
+            seconds = 0;
+            minutes++;
+            if (minutes >= 60) {
+                minutes = 0;
+                hours++;
+                if (hours >= 24) {
+                    hours = 0;
+                }
+            }
+        }
+    }
+    // Bước 3: Cập nhật hiển thị ngay trong ngắt.
+    update_clock_display();
+}
+
+// HÀM KHỞI TẠO TIMER
+
+void timer_Init() {
+    // Bước 1: Dừng Timer trước khi cấu hình (ghi bit STOP_MSK vào thanh ghi CONTROL)
+    IOWR_ALTERA_AVALON_TIMER_CONTROL(TIMER_0_BASE, ALTERA_AVALON_TIMER_CONTROL_STOP_MSK);
+
+    // Bước 2: Tính toán và cấu hình chu kỳ đếm (1 giây)
+    // Clock 50MHz => Period = 50,000,000 chu kỳ.
+    unsigned int period = 50000000;
+    // Ghi 16 bit thấp của Period vào thanh ghi PERIODL
+    IOWR_ALTERA_AVALON_TIMER_PERIODL(TIMER_0_BASE, period);
+    // Ghi 16 bit cao của Period (dịch phải 16 bit) vào thanh ghi PERIODH
+    IOWR_ALTERA_AVALON_TIMER_PERIODH(TIMER_0_BASE, period >> 16);
+
+    // Bước 3: Khởi động Timer với các chế độ
+    IOWR_ALTERA_AVALON_TIMER_CONTROL(TIMER_0_BASE,
+        // Bật chế độ đếm liên tục (CONT)
+        ALTERA_AVALON_TIMER_CONTROL_CONT_MSK |
+        // Bật chế độ tạo ngắt khi Timeout (ITO)
+        ALTERA_AVALON_TIMER_CONTROL_ITO_MSK |
+        // Bật/Khởi động Timer (START)
+        ALTERA_AVALON_TIMER_CONTROL_START_MSK);
+}
+
+// *****************************************************************
+// CHƯƠNG TRÌNH CHÍNH (MAIN PROGRAM)
+// *****************************************************************
+
+int main() {
+    //Khởi tạo Timer
+    timer_Init();
+
+    //Đăng ký hàm xử lý ngắt (Timer_IRQ_Handler) với Bộ điều khiển ngắt
+    alt_ic_isr_register(TIMER_0_IRQ_INTERRUPT_CONTROLLER_ID, // ID của Bộ điều khiển ngắt
+                        TIMER_0_IRQ,                      // Số hiệu ngắt (IRQ number) của Timer
+                        Timer_IRQ_Handler,                // Tên hàm xử lý ngắt
+                        NULL, NULL);
+
+    //Hiển thị giá trị 00:00:00 ban đầu
+    update_clock_display();
+
+    // Đọc trạng thái Switch ban đầu và lưu 4 bit thấp (SW[0] đến SW[3])
+    // PIO_SW_BASE có thể là 10, 18, 32 bit, nhưng ta chỉ quan tâm 4 bit thấp (0x0F = 1111)
+    last_sw_val = IORD_ALTERA_AVALON_PIO_DATA(PIO_SW_BASE) & 0x0F;
+
+    // Vòng lặp chính: Dùng để kiểm tra và xử lý trạng thái của các Switch
+    while(1) {
+        // Đọc toàn bộ trạng thái của Switch (ví dụ: 18 bits)
+        unsigned int full_sw_val = IORD_ALTERA_AVALON_PIO_DATA(PIO_SW_BASE);
+        // Lọc ra 4 bit thấp (SW[0] đến SW[3]) để xử lý
+        unsigned int sw_val = full_sw_val & 0x0F;
+
+        // -----------------------------------------------------------------
+        // LOGIC SW[0]: TOGGLE (DỪNG/CHẠY)
+        // -----------------------------------------------------------------
+        // Kích hoạt khi NHẢ nút SW[0] (cạnh xuống)
+        // Điều kiện: (Hiện tại TẮT) VÀ (Lần trước BẬT)
+        if (!(sw_val & 0x01) && (last_sw_val & 0x01)) {
+            clock_running = !clock_running; // Đảo trạng thái: CHẠY <-> DỪNG
+        }
+
+        // --- CHẾ ĐỘ SET TIME: Chỉ hoạt động khi đồng hồ DỪNG (clock_running == 0) ---
+        if (clock_running == 0) {
+
+            // SW[1]: Tăng GIÂY - Kích hoạt khi NHẤN nút SW[1] (cạnh lên)
+            // Điều kiện: (Hiện tại BẬT) VÀ (Lần trước TẮT)
+            if ((sw_val & 0x02) && !(last_sw_val & 0x02)) {
+                seconds++;
+                if(seconds >= 60) seconds = 0; // Đảo ngược về 0 sau 59
+                update_clock_display();
+            }
+
+            // SW[2]: Tăng PHÚT - Kích hoạt khi NHẤN nút SW[2] (cạnh lên)
+            if ((sw_val & 0x04) && !(last_sw_val & 0x04)) {
+                minutes++;
+                if(minutes >= 60) minutes = 0; // Đảo ngược về 0 sau 59
+                update_clock_display();
+            }
+
+            // SW[3]: Tăng GIỜ - Kích hoạt khi NHẤN nút SW[3] (cạnh lên)
+            if ((sw_val & 0x08) && !(last_sw_val & 0x08)) {
+                hours++;
+                if(hours >= 24) hours = 0; // Đảo ngược về 0 sau 23
+                update_clock_display();
+            }
+        }
+
+        // Lưu trạng thái 4 bit thấp hiện tại cho lần lặp tiếp theo
+        last_sw_val = sw_val;
+
+        // Thêm delay ngắn để giảm tải cho CPU (chống dội phím phần cứng)
+        usleep(10000); // 10ms delay
+    }
+
+    return 0;
+}
